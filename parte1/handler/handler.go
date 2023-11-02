@@ -23,20 +23,27 @@ func NewHandler(s service.Service) Handler {
 	}
 }
 
+// Attach agrega los handlers al router
 func (h *handler) Attach(r *mux.Router) {
 	r.HandleFunc("/resumen/{fecha}", h.HandleGet).Methods("GET", "OPTIONS")
 }
 
+// HandleGet es el handler para el endpoint /resumen/{fecha}?dias={dias}
 func (h *handler) HandleGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	vars := mux.Vars(r)
 	fecha := vars["fecha"]
+	if fecha == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("error: falta el parametro fecha"))
+		return
+	}
 
 	queryParams := r.URL.Query()
 	dias := queryParams.Get("dias")
 
 	if dias == "" {
-		dias = "0"
+		dias = "1"
 	}
 
 	resumen, err := h.Service.CalcularResumen(fecha, dias)
@@ -45,8 +52,6 @@ func (h *handler) HandleGet(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(fmt.Sprintf(`{"error": "%s"}`, err)))
 		return
 	}
-
-	resumen.Normalizar()
 
 	res, err := json.Marshal(resumen)
 	if err != nil {

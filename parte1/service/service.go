@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -28,6 +29,7 @@ type Resumen struct {
 	CompraMasAlta float64            `json:"compraMasAlta"`
 }
 
+// Normalizar redondea los valores del resumen a dos decimales
 func (r *Resumen) Normalizar() {
 	r.Total = math.Round(r.Total*100) / 100
 	r.CompraMasAlta = math.Round(r.CompraMasAlta*100) / 100
@@ -47,8 +49,7 @@ type Compra struct {
 	Date     string  `json:"date"`
 }
 
-const urlStr = "https://apirecruit-gjvkhl2c6a-uc.a.run.app/compras/"
-
+// CalcularResumen calcula el resumen de las compras a partir de la fecha y los dias indicados
 func (s *service) CalcularResumen(fecha, dias string) (*Resumen, error) {
 	date, err := time.Parse("2006-01-02", fecha)
 	if err != nil {
@@ -61,37 +62,88 @@ func (s *service) CalcularResumen(fecha, dias string) (*Resumen, error) {
 		return nil, errors.New(fmt.Sprintln("error convirtiendo dias a int: ", err))
 	}
 
-	comprasTotales := []Compra{}
+	compras, err := s.obtenerCompras(numDias, date)
+	if err != nil {
+		return nil, errors.New(fmt.Sprintln("error obteniendo compras concurrentemente: ", err))
+	}
+
+	resumen := s.obtenerResumen(compras)
+	resumen.Normalizar()
+
+	return resumen, nil
+}
+
+// obtenerCompras hace las llamadas a la API concurrentemente para obtener las compras del rango de días indicado
+func (s *service) obtenerCompras(numDias int, date time.Time) ([]*Compra, error) {
+	const urlStr = "https://apirecruit-gjvkhl2c6a-uc.a.run.app/compras/"
+
+	var (
+		wg             sync.WaitGroup
+		errCh          = make(chan error, numDias)
+		comprasTotales = make([][]*Compra, numDias)
+	)
 
 	for i := 0; i < numDias; i++ {
-		dia := date.Add(time.Duration(i) * time.Hour * 24).Format("2006-01-02")
+		wg.Add(1)
 
-		fmt.Println("llamando: ", urlStr+dia)
-		resp, err := http.Get(urlStr + dia)
-		if err != nil {
-			return nil, errors.New(fmt.Sprintln("error obteniendo url: ", err))
-		}
-		defer resp.Body.Close()
+		// Lanzar una goroutine por cada dia con el fin de que se hagan las llamadas concurrentemente
+		go func(i int) {
+			defer wg.Done()
+			dia := date.Add(time.Duration(i) * time.Hour * 24).Format("2006-01-02")
 
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, errors.New(fmt.Sprintln("error leyendo body: ", err))
-		}
+			resp, err := http.Get(urlStr + dia)
+			if err != nil {
+				errCh <- errors.New(fmt.Sprintln("error obteniendo url: ", err))
+				return
+			}
+			defer resp.Body.Close()
 
-		comprasDia := []Compra{}
-		err = json.Unmarshal(body, &comprasDia)
-		if err != nil {
-			return nil, errors.New(fmt.Sprintln("error unmarshaleando body: ", err))
-		}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				errCh <- errors.New(fmt.Sprintln("error leyendo body: ", err))
+				return
+			}
 
-		comprasTotales = append(comprasTotales, comprasDia...)
+			comprasDia := []*Compra{}
+			err = json.Unmarshal(body, &comprasDia)
+			if err != nil {
+				errCh <- errors.New(fmt.Sprintln("error unmarshaleando body: ", err))
+				return
+			}
+
+			comprasTotales[i] = comprasDia
+		}(i)
 	}
 
+	// Manejo de errores en las goroutines
+	go func() {
+		wg.Wait()
+		close(errCh)
+	}()
+
+	select {
+	case err := <-errCh:
+		return nil, err
+	default:
+	}
+
+	wg.Wait()
+
+	compras := []*Compra{}
+	for _, ct := range comprasTotales {
+		compras = append(compras, ct...)
+	}
+
+	return compras, nil
+}
+
+// obtenerResumen calcula el resumen de las compras
+func (s *service) obtenerResumen(compras []*Compra) *Resumen {
 	resumen := &Resumen{
-		ComprasPorTDC: map[string]float64{},
+		ComprasPorTDC: make(map[string]float64),
 	}
 
-	for _, compra := range comprasTotales {
+	for _, compra := range compras {
 		if compra.Compro {
 			resumen.Total += compra.Monto
 			resumen.ComprasPorTDC[compra.TDC] += compra.Monto
@@ -104,5 +156,5 @@ func (s *service) CalcularResumen(fecha, dias string) (*Resumen, error) {
 		}
 	}
 
-	return resumen, nil
+	return resumen
 }
